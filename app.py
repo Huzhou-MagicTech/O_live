@@ -484,8 +484,6 @@ def index():
                 
                 // 处理音频帧
                 socket.on('audio_frame', (data) => {
-                    if (!isPlaying || !audioContext) return;
-                    
                     try {
                         // 更新音频时间戳
                         audioTimestamp = data.timestamp;
@@ -511,21 +509,22 @@ def index():
                             }
                         }
                         
-                        // 添加到音频播放队列
+                        // 添加到音频播放队列，无论是否正在播放
                         audioQueue.push({ buffer, timestamp: data.timestamp });
+                        console.log(`收到音频帧，当前队列长度: ${audioQueue.length}`);
                         
-                        // 限制队列大小
+                        // 智能队列管理：根据网络条件动态调整队列大小
+                        const TARGET_QUEUE_SIZE = 30;
                         if (audioQueue.length > MAX_AUDIO_QUEUE) {
-                            audioQueue.shift();
-                        }
-                        
-                        // 智能播放音频：当队列达到最小长度时开始播放，避免音频卡顿
-                        if (audioQueue.length >= MIN_AUDIO_QUEUE) {
-                            playAudioFromQueue();
+                            // 队列过长，移除旧数据
+                            const excess = audioQueue.length - TARGET_QUEUE_SIZE;
+                            audioQueue.splice(0, excess);
+                            console.log(`队列过长，已移除 ${excess} 帧，当前队列长度: ${audioQueue.length}`);
                         }
                         
                     } catch (error) {
                         console.error('处理音频帧错误:', error);
+                        // 在浏览器中不需要traceback
                     }
                 });
                 
@@ -543,37 +542,115 @@ def index():
                 });
             }
             
-            // 播放队列中的音频
-            function playAudioFromQueue() {
-                if (audioQueue.length === 0 || !audioContext) return;
+            // 音频播放控制器
+            let audioController = {
+                isPlaying: false,
+                nextPlayTime: 0,
+                lastUpdateTime: 0,
+                intervalId: null,
                 
-                try {
-                    // 批量播放音频，减少音频上下文调用次数
-                    const batchSize = Math.min(5, audioQueue.length);
-                    let currentTime = audioContext.currentTime;
+                start: function() {
+                    if (this.isPlaying) return;
+                    this.isPlaying = true;
+                    this.nextPlayTime = audioContext.currentTime;
+                    this.lastUpdateTime = Date.now();
                     
-                    for (let i = 0; i < batchSize; i++) {
-                        const audioFrame = audioQueue.shift();
-                        const source = audioContext.createBufferSource();
-                        source.buffer = audioFrame.buffer;
-                        source.connect(audioContext.destination);
-                        
-                        // 计算播放时间，确保音频连续播放
-                        const bufferDuration = audioFrame.buffer.duration;
-                        
-                        try {
-                            source.start(currentTime);
-                            currentTime += bufferDuration;
-                        } catch (error) {
-                            console.error('播放音频片段错误:', error);
-                            // 跳过当前片段，继续播放下一个
-                            continue;
-                        }
+                    // 使用setInterval持续处理队列，确保即使队列为空也能继续监听
+                    if (!this.intervalId) {
+                        const that = this;
+                        this.intervalId = setInterval(function() {
+                            that._processQueue();
+                        }, 50); // 每50ms检查一次队列
                     }
-                } catch (error) {
-                    console.error('播放音频队列错误:', error);
+                    
+                    console.log('音频控制器已启动');
+                },
+                
+                stop: function() {
+                    this.isPlaying = false;
+                    if (this.intervalId) {
+                        clearInterval(this.intervalId);
+                        this.intervalId = null;
+                    }
+                    console.log('音频控制器已停止');
+                },
+                
+                reset: function() {
+                    this.nextPlayTime = audioContext.currentTime;
+                    this.lastUpdateTime = Date.now();
+                    audioQueue.length = 0;
+                    console.log('音频控制器已重置');
+                },
+                
+                _processQueue: function() {
+                    if (!this.isPlaying || !audioContext) {
+                        return;
+                    }
+                    
+                    try {
+                        const currentTime = audioContext.currentTime;
+                        
+                        // 如果队列为空，返回但继续下一次检查
+                        if (audioQueue.length === 0) {
+                            return;
+                        }
+                        
+                        // 计算队列中可播放的帧数
+                        let framesToPlay = 0;
+                        let totalDuration = 0;
+                        
+                        // 确保播放时间不会落后太多
+                        if (this.nextPlayTime < currentTime) {
+                            this.nextPlayTime = currentTime;
+                        }
+                        
+                        // 计算能在当前时间窗口内播放的帧数
+                        for (let i = 0; i < audioQueue.length; i++) {
+                            const frame = audioQueue[i];
+                            totalDuration += frame.buffer.duration;
+                            if (this.nextPlayTime + totalDuration <= currentTime + 0.5) { // 预播放0.5秒的音频
+                                framesToPlay++;
+                            } else {
+                                break;
+                            }
+                        }
+                        
+                        // 至少播放1帧，确保音频持续播放
+                        framesToPlay = Math.max(1, framesToPlay);
+                        
+                        console.log(`处理音频队列，当前队列长度: ${audioQueue.length}，计划播放帧数: ${framesToPlay}`);
+                        
+                        // 播放音频帧
+                        for (let i = 0; i < framesToPlay; i++) {
+                            if (audioQueue.length === 0) break;
+                            
+                            const audioFrame = audioQueue.shift();
+                            const source = audioContext.createBufferSource();
+                            source.buffer = audioFrame.buffer;
+                            source.connect(audioContext.destination);
+                            
+                            // 精确计算播放时间
+                            const bufferDuration = audioFrame.buffer.duration;
+                            
+                            try {
+                                source.start(this.nextPlayTime);
+                                this.nextPlayTime += bufferDuration;
+                                console.log(`播放音频帧，时长: ${bufferDuration.toFixed(3)}s，下次播放时间: ${this.nextPlayTime.toFixed(3)}s`);
+                            } catch (error) {
+                                console.error('播放音频片段错误:', error);
+                                // 调整下一次播放时间，跳过当前片段
+                                this.nextPlayTime = currentTime;
+                                continue;
+                            }
+                        }
+                        
+                    } catch (error) {
+                        console.error('播放音频队列错误:', error);
+                        // 错误处理：重置播放状态
+                        this.nextPlayTime = audioContext.currentTime;
+                    }
                 }
-            }
+            };
             
             // 检查音画同步
             function checkSync() {
@@ -608,8 +685,10 @@ def index():
                     } catch (error) {
                         console.error('音频上下文初始化失败:', error);
                         alert('无法初始化音频上下文，请检查浏览器权限设置');
+                        return false;
                     }
                 }
+                return true;
             }
             
             // 播放/暂停控制
@@ -617,6 +696,7 @@ def index():
                 if (isPlaying) {
                     // 暂停
                     isPlaying = false;
+                    audioController.stop();
                     playBtn.textContent = '播放';
                     syncStatus.textContent = '已暂停';
                     syncStatus.style.color = '#ff9800';
@@ -629,6 +709,8 @@ def index():
                     playBtn.textContent = '暂停';
                     syncStatus.textContent = '播放中...';
                     syncStatus.style.color = '#4CAF50';
+                    // 启动音频控制器
+                    audioController.start();
                 }
             }
             
@@ -637,7 +719,8 @@ def index():
                 // 重置时间戳和队列
                 videoTimestamp = 0;
                 audioTimestamp = 0;
-                audioQueue.length = 0;
+                // 重置音频控制器
+                audioController.reset();
                 
                 // 重新初始化Socket连接
                 socket.disconnect();
