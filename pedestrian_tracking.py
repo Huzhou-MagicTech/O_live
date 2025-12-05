@@ -26,7 +26,7 @@ except ImportError:
 
 # 读取指定的视频文件
 # video_path = 'static/test_video/1.mp4'
-video_path = 'rtmp://192.168.0.220:1935/live/stream_name'
+video_path = 'rtmp://192.168.1.2:1935/live/123'
 
 cap = cv2.VideoCapture(video_path)
 
